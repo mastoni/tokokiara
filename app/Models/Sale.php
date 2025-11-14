@@ -12,6 +12,7 @@ class Sale extends Model
 {
     use HasFactory;
     use SoftDeletes;
+    use App\Traits\Userstamps;
     
     protected $fillable = [
         'invoice_number',
@@ -31,7 +32,39 @@ class Sale extends Model
         'deleted_by',
         'cart_snapshot',
         'sale_time',
+        'tax_amount',
+        'shipping_amount',
+        'loyalty_points_earned',
+        'loyalty_points_redeemed',
+        'staff_note',
+        'customer_note',
+        'delivery_address',
+        'delivery_date',
     ];
+
+    protected $casts = [
+        'sale_date' => 'datetime',
+        'sale_time' => 'datetime',
+        'delivery_date' => 'datetime',
+        'total_amount' => 'decimal:2',
+        'discount' => 'decimal:2',
+        'amount_received' => 'decimal:2',
+        'profit_amount' => 'decimal:2',
+        'tax_amount' => 'decimal:2',
+        'shipping_amount' => 'decimal:2',
+        'loyalty_points_earned' => 'integer',
+        'loyalty_points_redeemed' => 'integer',
+        'cart_snapshot' => 'array',
+    ];
+
+    const STATUS_COMPLETED = 'completed';
+    const STATUS_PENDING = 'pending';
+    const STATUS_REFUNDED = 'refunded';
+    const STATUS_CANCELLED = 'cancelled';
+
+    const PAYMENT_STATUS_PAID = 'paid';
+    const PAYMENT_PARTIAL = 'partial';
+    const PAYMENT_UNPAID = 'unpaid';
 
     protected static function boot()
     {
@@ -115,5 +148,250 @@ class Sale extends Model
     public function contact()
     {
         return $this->belongsTo(Contact::class);
+    }
+
+    public function createdBy()
+    {
+        return $this->belongsTo(User::class, 'created_by');
+    }
+
+    public function deletedBy()
+    {
+        return $this->belongsTo(User::class, 'deleted_by');
+    }
+
+    // Scopes
+    public function scopeCompleted($query)
+    {
+        return $query->where('status', self::STATUS_COMPLETED);
+    }
+
+    public function scopePending($query)
+    {
+        return $query->where('status', self::STATUS_PENDING);
+    }
+
+    public function scopeRefunded($query)
+    {
+        return $query->where('status', self::STATUS_REFUNDED);
+    }
+
+    public function scopeByCustomer($query, $customerId)
+    {
+        return $query->where('contact_id', $customerId);
+    }
+
+    public function scopeByPaymentStatus($query, $status)
+    {
+        return $query->where('payment_status', $status);
+    }
+
+    // Accessors
+    public function getFormattedTotalAttribute()
+    {
+        return number_format($this->total_amount, 2);
+    }
+
+    public function getFormattedDiscountAttribute()
+    {
+        return number_format($this->discount, 2);
+    }
+
+    public function getFormattedTaxAttribute()
+    {
+        return number_format($this->tax_amount, 2);
+    }
+
+    public function getGrandTotalAttribute()
+    {
+        return $this->total_amount + $this->tax_amount + $this->shipping_amount - $this->discount;
+    }
+
+    public function getFormattedGrandTotalAttribute()
+    {
+        return number_format($this->grand_total, 2);
+    }
+
+    public function getBalanceAttribute()
+    {
+        return $this->grand_total - $this->amount_received;
+    }
+
+    public function getFormattedBalanceAttribute()
+    {
+        return number_format($this->balance, 2);
+    }
+
+    public function getStatusLabelAttribute()
+    {
+        return ucfirst($this->status);
+    }
+
+    public function getPaymentStatusLabelAttribute()
+    {
+        return ucfirst($this->payment_status);
+    }
+
+    public function getIsOverdueAttribute()
+    {
+        return $this->payment_status === self::PAYMENT_UNPAID &&
+               $this->sale_date->lt(now()->subDays(30));
+    }
+
+    // Methods
+    public function isCompleted()
+    {
+        return $this->status === self::STATUS_COMPLETED;
+    }
+
+    public function isPending()
+    {
+        return $this->status === self::STATUS_PENDING;
+    }
+
+    public function isRefunded()
+    {
+        return $this->status === self::STATUS_REFUNDED;
+    }
+
+    public function isPaid()
+    {
+        return $this->payment_status === self::PAYMENT_PAID;
+    }
+
+    public function isPartiallyPaid()
+    {
+        return $this->payment_status === self::PAYMENT_PARTIAL;
+    }
+
+    public function isUnpaid()
+    {
+        return $this->payment_status === self::PAYMENT_UNPAID;
+    }
+
+    public function canBeRefunded()
+    {
+        return $this->isCompleted() && $this->isPaid();
+    }
+
+    public function canBeEdited()
+    {
+        return $this->isPending();
+    }
+
+    public function canBeCancelled()
+    {
+        return $this->isPending() || $this->isUnpaid();
+    }
+
+    public function addPayment($amount, $paymentMethod, $note = '')
+    {
+        $newAmountReceived = $this->amount_received + $amount;
+        $grandTotal = $this->grand_total;
+
+        // Update payment status
+        if ($newAmountReceived >= $grandTotal) {
+            $paymentStatus = self::PAYMENT_PAID;
+        } elseif ($newAmountReceived > 0) {
+            $paymentStatus = self::PAYMENT_PARTIAL;
+        } else {
+            $paymentStatus = self::PAYMENT_UNPAID;
+        }
+
+        $this->update([
+            'amount_received' => $newAmountReceived,
+            'payment_status' => $paymentStatus,
+        ]);
+
+        // Create transaction record
+        Transaction::create([
+            'sales_id' => $this->id,
+            'store_id' => $this->store_id,
+            'contact_id' => $this->contact_id,
+            'transaction_date' => now(),
+            'amount' => $amount,
+            'payment_method' => $paymentMethod,
+            'transaction_type' => 'payment',
+            'note' => $note,
+            'created_by' => auth()->id(),
+        ]);
+
+        return $this;
+    }
+
+    public function refund($reason = '')
+    {
+        if (!$this->canBeRefunded()) {
+            return false;
+        }
+
+        DB::transaction(function () use ($reason) {
+            // Restore product quantities
+            foreach ($this->saleItems as $item) {
+                $product = $item->product;
+                if ($product) {
+                    $product->updateStock(
+                        $product->quantity + $item->quantity,
+                        'Sale Refund: ' . $this->invoice_number
+                    );
+                }
+            }
+
+            // Create refund transaction
+            if ($this->amount_received > 0) {
+                Transaction::create([
+                    'sales_id' => $this->id,
+                    'store_id' => $this->store_id,
+                    'contact_id' => $this->contact_id,
+                    'transaction_date' => now(),
+                    'amount' => -$this->amount_received,
+                    'payment_method' => 'refund',
+                    'transaction_type' => 'refund',
+                    'note' => $reason,
+                    'created_by' => auth()->id(),
+                ]);
+            }
+
+            // Update sale status
+            $this->update([
+                'status' => self::STATUS_REFUNDED,
+                'staff_note' => ($this->staff_note ?? '') . "\n\nRefunded: {$reason}",
+            ]);
+
+            // Remove loyalty points if earned
+            if ($this->loyalty_points_earned > 0 && $this->contact) {
+                $this->contact->redeemLoyaltyPoints(
+                    $this->loyalty_points_earned,
+                    "Sale refund: {$this->invoice_number}"
+                );
+            }
+        });
+
+        return true;
+    }
+
+    public function getReceiptData()
+    {
+        return [
+            'invoice_number' => $this->invoice_number,
+            'sale_date' => $this->sale_date->format('Y-m-d H:i:s'),
+            'customer' => $this->contact?->name ?? 'Walk-in Customer',
+            'items' => $this->saleItems->map(function ($item) {
+                return [
+                    'name' => $item->product?->name ?? $item->product_name,
+                    'quantity' => $item->quantity,
+                    'unit_price' => number_format($item->unit_price, 2),
+                    'total' => number_format($item->total_price, 2),
+                ];
+            }),
+            'subtotal' => number_format($this->total_amount, 2),
+            'discount' => number_format($this->discount, 2),
+            'tax' => number_format($this->tax_amount, 2),
+            'total' => number_format($this->grand_total, 2),
+            'amount_paid' => number_format($this->amount_received, 2),
+            'balance' => number_format($this->balance, 2),
+            'payment_method' => $this->transactions->pluck('payment_method')->implode(', '),
+            'store' => $this->store?->name,
+        ];
     }
 }
