@@ -3,7 +3,9 @@
 namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
 use Inertia\Inertia;
+use Inertia\Response;
 use App\Models\CashLog;
 use App\Models\Store;
 use Illuminate\Support\Facades\DB;
@@ -19,9 +21,26 @@ use App\Models\User;
 use App\Models\Expense;
 use App\Models\SalaryRecord;
 use Illuminate\Support\Facades\Auth;
+use App\Services\ReportGenerationService;
+use App\Services\ReportSchedulingService;
+use App\Services\AnalyticsService;
 
 class ReportController extends Controller
 {
+    protected $reportService;
+    protected $scheduleService;
+    protected $analyticsService;
+
+    public function __construct(
+        ReportGenerationService $reportService,
+        ReportSchedulingService $scheduleService,
+        AnalyticsService $analyticsService
+    ) {
+        $this->reportService = $reportService;
+        $this->scheduleService = $scheduleService;
+        $this->analyticsService = $analyticsService;
+        $this->middleware(['auth', 'permission:reports']);
+    }
     public function getDailyCashReport(Request $request)
     {
         $transaction_date = $request->only(['transaction_date']);
@@ -525,5 +544,211 @@ class ReportController extends Controller
             'stores' => $stores,
             'report' => $report,
         ]);
+    }
+
+    /**
+     * Display the enhanced reports dashboard.
+     */
+    public function index(): Response
+    {
+        return Inertia::render('Reports/Index');
+    }
+
+    /**
+     * Generate a sales report.
+     */
+    public function salesReport(Request $request): JsonResponse
+    {
+        $filters = $request->all();
+        $reportData = $this->reportService->generateSalesReport($filters);
+
+        return response()->json([
+            'success' => true,
+            'data' => $reportData
+        ]);
+    }
+
+    /**
+     * Generate an inventory report.
+     */
+    public function inventoryReport(Request $request): JsonResponse
+    {
+        $filters = $request->all();
+        $reportData = $this->reportService->generateInventoryReport($filters);
+
+        return response()->json([
+            'success' => true,
+            'data' => $reportData
+        ]);
+    }
+
+    /**
+     * Generate a financial report.
+     */
+    public function financialReport(Request $request): JsonResponse
+    {
+        $filters = $request->all();
+        $reportData = $this->reportService->generateFinancialReport($filters);
+
+        return response()->json([
+            'success' => true,
+            'data' => $reportData
+        ]);
+    }
+
+    /**
+     * Generate a customer report.
+     */
+    public function customerReport(Request $request): JsonResponse
+    {
+        $filters = $request->all();
+        $reportData = $this->reportService->generateCustomerReport($filters);
+
+        return response()->json([
+            'success' => true,
+            'data' => $reportData
+        ]);
+    }
+
+    /**
+     * Export report to PDF.
+     */
+    public function exportPDF(Request $request)
+    {
+        $reportType = $request->input('report_type');
+        $filters = $request->except('report_type');
+
+        $reportData = $this->getReportData($reportType, $filters);
+        $filename = "{$reportType}_report_" . now()->format('Y-m-d_H-i-s') . '.pdf';
+
+        return $this->reportService->exportToPDF($reportData, $filename);
+    }
+
+    /**
+     * Export report to Excel.
+     */
+    public function exportExcel(Request $request)
+    {
+        $reportType = $request->input('report_type');
+        $filters = $request->except('report_type');
+
+        $reportData = $this->getReportData($reportType, $filters);
+        $filename = "{$reportType}_report_" . now()->format('Y-m-d_H-i-s') . '.xlsx';
+
+        return $this->reportService->exportToExcel($reportData, $reportType, $filename);
+    }
+
+    /**
+     * Export report to CSV.
+     */
+    public function exportCSV(Request $request)
+    {
+        $reportType = $request->input('report_type');
+        $filters = $request->except('report_type');
+
+        $reportData = $this->getReportData($reportType, $filters);
+        $filename = "{$reportType}_report_" . now()->format('Y-m-d_H-i-s') . '.csv';
+
+        return $this->reportService->exportToCSV($reportData, $filename);
+    }
+
+    /**
+     * Schedule a custom report.
+     */
+    public function scheduleReport(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'report_type' => 'required|in:sales,inventory,financial,customers',
+            'recipients' => 'required|array|min:1',
+            'recipients.*' => 'email',
+            'filters' => 'array',
+            'schedule' => 'nullable|string'
+        ]);
+
+        $result = $this->scheduleService->scheduleCustomReport(
+            $validated['report_type'],
+            $validated['recipients'],
+            $validated['filters'] ?? [],
+            $validated['schedule'] ?? null
+        );
+
+        return response()->json($result);
+    }
+
+    /**
+     * Get analytics dashboard data.
+     */
+    public function analyticsDashboard(Request $request): JsonResponse
+    {
+        $period = $request->input('period', '30days');
+        $storeId = $request->input('store_id');
+
+        $analytics = $this->analyticsService->generateBusinessAnalytics($period, $storeId);
+
+        return response()->json([
+            'success' => true,
+            'data' => $analytics
+        ]);
+    }
+
+    /**
+     * Get scheduled reports configuration.
+     */
+    public function scheduleConfig(): JsonResponse
+    {
+        $config = $this->scheduleService->getScheduledReportsConfig();
+
+        return response()->json([
+            'success' => true,
+            'data' => $config
+        ]);
+    }
+
+    /**
+     * Update scheduled reports configuration.
+     */
+    public function updateScheduleConfig(Request $request): JsonResponse
+    {
+        $config = $request->all();
+
+        $result = $this->scheduleService->updateScheduledReportsConfig($config);
+
+        return response()->json([
+            'success' => $result,
+            'message' => $result ? 'Schedule configuration updated successfully' : 'Failed to update schedule configuration'
+        ]);
+    }
+
+    /**
+     * Get report delivery logs.
+     */
+    public function deliveryLogs(Request $request): JsonResponse
+    {
+        $filters = $request->all();
+        $logs = $this->scheduleService->getReportDeliveryLogs($filters);
+
+        return response()->json([
+            'success' => true,
+            'data' => $logs
+        ]);
+    }
+
+    /**
+     * Get report data based on type.
+     */
+    private function getReportData($reportType, $filters)
+    {
+        switch ($reportType) {
+            case 'sales':
+                return $this->reportService->generateSalesReport($filters);
+            case 'inventory':
+                return $this->reportService->generateInventoryReport($filters);
+            case 'financial':
+                return $this->reportService->generateFinancialReport($filters);
+            case 'customers':
+                return $this->reportService->generateCustomerReport($filters);
+            default:
+                throw new \InvalidArgumentException("Unsupported report type: {$reportType}");
+        }
     }
 }
